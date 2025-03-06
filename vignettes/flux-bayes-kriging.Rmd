@@ -1,0 +1,190 @@
+---
+title: "Extrapolation of chamber fluxes using Bayesian Kriging"
+author: "Peter E. Levy"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    number_sections: yes
+    toc: no
+---
+
+```{r, rendering, eval=FALSE}
+library(rmarkdown)
+library(here)
+knitr::purl("vignettes/LincolnFluxDataAnalysis.Rmd",
+  output = "vignettes/LincolnFluxDataAnalysis.R")
+system.time(rmarkdown::render("vignettes/LincolnFluxDataAnalysis.Rmd"))
+tools::texi2pdf("LincolnFluxDataAnalysis.tex")
+source("LincolnFluxDataAnalysis.R")
+knitr::knit("LincolnFluxDataAnalysis.Rnw")
+```
+
+## Background
+This document describes a probabilistic geostatistical approach, Bayesian Kriging, for addressing the issue of upscaling chamber flux measurements to larger domains (e.g. whole fields or farms).  The approach is related to Ordinary Kriging, in that it is a method for interpolating between data points, based on the observed spatial covariance structure, commonly shown graphically as a (semi-)variogram.  However, in the Bayesian form, rather than estimating the parameters of the variogram by ordinary least-squares, we represent them as probability distributions, and update them using the data and Bayes Theorem via Monte Carlo Markov Chain (MCMC) methods.  The advantage of this approach is that it makes spatial predictions, based on the observed chamber flux data, but accounts explicitly for the uncertainty in the spatial pattern across the domain. Where the area sampled is small compared to the domain of interest (typically \textless 1\% in the case of GHG measurements in agricultural fields), this is a major source of uncertainty which is generally ignored.
+
+## How the code works
+In brief, the chamber flux data are interpolated over a prediction grid using the krige.bayes function in the geoR package.  The uncertainty in this mean is given by the variability in the mean across all the simulations produced by krige.bayes.
+Functions are contained in the file `source(here::here("R/flux-bayes-kriging.R"))`.
+A more thorough description of the background and terminology is given [here](https://nerc-ceh.github.io/beem/ae/ae-09-spatial.html).
+
+## Packages required
+The code is written in the R language. The following R packages are used for graphics and spatial analysis.
+
+```{r, clean up and load required packages}
+here::i_am("vignettes/LincolnFluxDataAnalysis.Rmd")
+# install.packages(c("here", "ggplot2", "raster", "geoR", "viridis")) # if not already installed
+library(here)
+library(ggplot2)
+library(raster)
+library(geoR)
+library(viridis)
+source(here::here("R/flux-bayes-kriging.R"))
+set.seed(586)
+```
+
+## Defining the prediction grid
+
+A rectangular grid is defined for predictions, typically the extent of a field. The resolution (cell size) can be made coarser or finer, at the cost of compuation time.  We use the GB Ordnance Survey grid reference system (EPSG:27700) as the coordinate reference system (crs), though no reprojection is needed here.
+
+```{r, set_constants}
+######### Set up prediction grid. #############
+# Define size and location of grid:
+# extentField <- extent(494100, 494350, 380750, 381050)
+extentField <- extent(494247.6, 494291.6, 380900.1, 380950.1)
+# Smaller resolution = higher computation time
+res <- 3 # resolution for prediction grid, m
+# Define the coordinate rotation system (crs) for the grid
+crs_OSGB <- raster::crs("EPSG:27700")  # a terra crs object
+
+# define a raster object with the above extent, resolution and crs
+r <- raster(extentField, resolution = res, crs = crs_OSGB)
+```
+
+## Chamber flux data
+We read in some example data from a CSV file, and plot the histogram of the fluxes.
+
+```{r, simulate_chamber_data, eval=FALSE, echo=FALSE}
+# read real data with locations
+df <- read.csv(file = here::here("data/df_flux.csv"))
+m_xy <- as.matrix(df[, 3:4])
+# simulate data at these locations with a Gaussian random field
+sim1 <- grf(16, grid = m_xy, cov.pars = c(23, 32), mean = 5)
+df_sim <- data.frame(easting = m_xy[, 1], northing = m_xy[, 2], flux = sim1$data)
+write.csv(df_sim, file = here::here("data/df_flux_sim.csv"), row.names = FALSE)
+```
+
+
+```{r, read_chamber_data, eval=TRUE}
+df <- read.csv(file = here::here("data/df_flux_sim.csv"))
+names(df)
+summary(df)
+head(df)
+```
+
+```{r, plot_histogram}
+ggplot(df, aes(x = flux)) + geom_histogram(bins = 30)
+```
+
+We can rasterise the data and plot them on the prediction grid.
+
+```{r, plot_spatially}
+r_obs <- raster::rasterize(x = df[, 1:2], r, field = df[, 3])
+plot(r_obs)
+points(df[, 1:2])
+title(main = "Flux from 16 chamber locations rasterised on 3-m grid (nmol/m2/s)")
+```
+
+For working in `geoR`, the data need to be converted to a "geodata" object, specifying which columns contain the coordinates and the  flux data values. Additional covariates could be included in the data, but are not used here. The data are then summarised and plotted.
+
+```{r, summarise_data}
+gdf <- as.geodata(df, coords.col = 1:2, data.col = 3)
+summary(gdf)
+plot(gdf)
+```
+
+We can plot a basic empirical variogram from the data.
+```{r, variogram}
+vgm <- variog(gdf)
+plot(vgm)
+```
+
+As expected, variance increases with distance, but the variogram is not smooth, and the range is not clear. There is no clear asymptote, but there are fewer pairs of points with large distances, so these points receive less weight, and the variogram is less reliable at large distances.
+
+## Prior distributions for the variogram model parameters
+For a Bayesian analysis, we need to specify the prior distributions for the parameters of the variogram model.  Here we use a uniform prior for the range ($\phi$) and mean ($\beta$), and a reciprocal prior for the sill ($\sigma^2$).  This means that all values of $\phi$ and $\beta$ within the specified range are equally probable, whereas large values of $\sigma^2$ become increasingly improbable, in proportion to their reciprocal. The prior distributions are plotted below. The intercept of "nugget" ($\tau$) is assumed to be zero, but can be estimated as well. Alternative values and assumptions can be specified by changing the  code within `krige.bayes`.
+
+```{r, plot_priors, eval=TRUE, echo=FALSE}
+par(mfrow = c(1, 3))
+maxdist <- vgm$max.dist
+maxbeta <- 2 * mean(df$flux, na.rm = TRUE)
+seqphi_sparse  <- seq(0, 2 * maxdist)
+seqbeta_sparse <- seq(0, maxbeta)
+plot(seqphi_sparse, rep(1/length(seqphi_sparse), length(seqphi_sparse)), type = "l",
+  xlab = "phi", ylab = "Prior probability")
+lines(c(0, seqphi_sparse, 2*maxdist), c(0, rep(1/length(seqphi_sparse), length(seqphi_sparse)), 0), type = "l")
+
+plot((1/seq(0, 2, by = 0.1)^2)/100, type = "l", xlab = "sigmasq", ylab = "Prior probability")
+
+plot(seqbeta_sparse, rep(1/length(seqbeta_sparse), length(seqbeta_sparse)), type = "l",
+  xlab = "beta", ylab = "Prior probability")
+lines(c(0, seqbeta_sparse, 2*maxbeta), c(0, rep(1/length(seqbeta_sparse), length(seqbeta_sparse)), 0), type = "l")
+```
+
+
+## Bayesian Kriging
+The `krige.bayes` function is wrapped inside the `interpolate_flux` function, and requires three arguments:
+
+- `df` is the data frame containing the chamber flux data
+- `r` is the raster object defining the prediction grid
+- `n_posterior` is the number of posterior samples to draw from the MCMC chain.  The default is 1000, but 10000 is recommended for a more accurate estimate of the posterior distribution.
+
+```{r, BayesianKriging}
+system.time(bsp <- interpolate_flux(df, r, n_posterior = 10000))
+```
+
+We can now examine the estmated variogram model with its approximate bounds.
+
+```{r, variogram2}
+par(mfrow = c(1, 1))
+vgm_lfit <- likfit(gdf, ini = c(0.5, 0.5), fix.nugget = FALSE, messages = FALSE)
+vgm <- variog(gdf)
+vgm_env <- variog.model.env(gdf, obj.v = vgm,
+                             model.pars = vgm_lfit)
+plot(vgm, env = vgm_env)
+lines(bsp, summary.posterior = mean)
+lines(bsp, summ = median, lty = 2)
+lines(bsp, summ = "mode", post = "par", lwd = 2, lty = 2)
+legend(0.15, 50, legend = c("posterior mean",
+  "posterior median"), lty = c(1, 2), lwd = c(1, 1), cex = 0.8)
+```
+
+The joint posterior distributions of the variogram model parameters are shown below. The mean values of the parameters are also displayed.
+
+```{r, posteriorDistributions}
+par(mfrow = c(1, 3))
+plot(density(bsp$posterior$sample$phi), main = "", xlab = expression(phi))
+plot(density(bsp$posterior$sample$sigmasq), main = "", xlab = expression(sigma^2))
+plot(density(bsp$posterior$sample$beta), main = "", xlab = expression(beta))
+colMeans(bsp$posterior$sample)
+```
+
+
+## Predictions and uncertainty
+The mean of the predicted fluxes are plotted below. The mean is the average of the posterior samples, and gives the best (most probable) single prediction we can make.
+
+```{r, interpolateChamberFlux1}
+plot_mean_prediction(bsp, r, df)
+```
+
+The standard deviation of the posterior samples (below) is the appropriate measure of uncertainty in the predictions. This is lowest in areas where there are more data points and highest where there are fewer data points or where the data are more variable.
+
+```{r, interpolateChamberFlux2}
+plot_sigma_prediction(bsp, r, df)
+```
+
+As well as these summary variables, we can plot individual realisations of the flux field, to give an idea of the range of possible spatial patterns consistent with the data. Here we show six examples, but typically thousands are generated in the posterior sampling.
+
+```{r, interpolateChamberFlux3}
+plot_realisations(bsp, r, df, n_realisations = 6)
+```
+
