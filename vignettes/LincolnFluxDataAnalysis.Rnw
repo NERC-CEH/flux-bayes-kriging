@@ -1,0 +1,608 @@
+%% system.time(knitr::knit("LincolnFluxDataAnalysis.Rnw"))
+%% tools::texi2pdf("LincolnFluxDataAnalysis.tex")
+%% knitr::purl("LincolnFluxDataAnalysis.Rnw")
+%% source("LincolnFluxDataAnalysis.R")
+%% knitr::knit("LincolnFluxDataAnalysis.Rnw")
+
+\documentclass{article}
+\begin{document}
+
+\title{Extrapolation of chamber N$_2$O fluxes using Bayesian Kriging, and verification by eddy covariance: data processing and analysis}
+\author{Peter E. Levy}
+\maketitle
+
+\section{Background}
+This document describes the processing of data for the paper \textit{Extrapolation of chamber N$_2$O fluxes using Bayesian Kriging, and verification by eddy covariance}, currently in preparation.  In the paper, we use a formal approach, Bayesian Kriging, for addressing the issue of upscaling chamber flux measurements to the larger domain measured by eddy covariance, so that the two methods can be compared on an equivalent basis.  The approach is related to Ordinary Kriging, in that it is a method for interpolating between data points, based on the observed spatial covariance structure, commonly shown graphically as a (semi-)variogram.  However, in the Bayesian form, rather than estimating the parameters of the variogram by least-squares regression, we put a represent them as a distribution, and update the distribution using the data and Bayes Theorem via Monte Carlo Markov Chain (MCMC) methods.  The advantage of this approach is that it makes spatial predictions, based on the observed chamber flux data, but accounts explicitly for the uncertainty in the spatial pattern across the domain. Where the area sampled is small compared to the domain of interest (typically \textless 1\% in the case of GHG measurements in agricultural fields), this is a major source of uncertainty which is generally ignored.
+
+\section{How the code and documentation works}
+All the code is written in \verb@R@ with the ``literate programming'' package \verb@knitr@.  The file \verb@LincolnFluxDataAnalysis.Rnw@ contains the \verb@R@ code and documentation in \LaTeX\, which is processed by the R command: \\
+\verb@knitr::knit("LincolnFluxDataAnalysis.Rnw")@ \\
+\\
+to produce the numerical results, graphics and a \verb@.tex@ \LaTeX\ file.  The .tex file is then converted to (this) pdf document with the R command: \\
+\verb@tools::texi2pdf("LincolnFluxDataAnalysis.tex")@ \\
+\\
+The R code is split into ``code chunks'', each of which can be set to not run with eval=FALSE to save time (particularly, \verb@readStackFootprint@ takes 30 mins to run, and interpolating over large or dense grids is slow).  Pre-calculated data is loaded from a .RData file at the start, and only re-calculated as needs be.  \\
+\\
+In brief, we first set the co-ordinates of the eddy covariance flux tower and the spatial prediction grid to interpolate chamber fluxes over.  We then read in all the various data sources, and do the necessary processing and merging.  The chamber fluxes are interpolated over the prediction grid using the \verb@krige.bayes@ function in the \verb@geoR@ package.  We extract the flux footprint over this prediction grid, and use this to get a footprint-weighted mean chamber flux.  This should produce a chamber-derived flux with the same spatial sampling characteristics as the eddy covariance measurement.  The uncertainty in this mean is given by the variability in the mean across all the simulations produced by \verb@krige.bayes@.  The footprint-weighted chamber fluxes are plotted against the eddy covariance fluxes, and contrasted with the mean and uncertainties of the unweighted mean chamber flux (without interpolation).
+
+\section{Packages required}
+The following R packages are used for graphics and spatial analysis.
+<<clean up and load required packages>>=
+rm(list=ls(all=TRUE))
+#install.packages("Rmisc")
+require(knitr)
+require(ggplot2)
+require(RColorBrewer)
+require(ggmap)
+require(sp)
+require(rgdal)
+require(raster)
+require(openair)
+require(geoR)
+require(Rmisc)
+Sys.setenv(TZ="UTC")
+wd <- getwd()
+@
+
+\section{Reading pre-calculated data or recalculating}
+If eval=FALSE for any of the later code chunks, we need to load pre-calculated data with the next code chunk.  If eval=TRUE for any of the later code chunks, the precalculated data in memory will be over-written (but not on disk with out doing the manual \verb@save@, commented out in this code chunk).
+<<load_precalculated_data>>=
+#save(Fn2oCh, Fn2oChYork, Fn2oEC, Fco2EC, mergedEC_df, mergedChEC_df, stackFootprint, file="Fn2o_Brattleby.RData")
+load("Fn2o_Brattleby.RData", verbose=TRUE)
+@
+
+\section{Defining tower and prediction grid}
+<<set_constants>>=
+# OSGB 1936 / British National Grid 
+projOSGB <-  CRS("+proj=tmerc +lat_0=49 +lon_0=-2 +k=0.9996012717 +x_0=400000 +y_0=-100000 +ellps=airy +datum=OSGB36 +units=m +no_defs")
+# lat / lon 
+projlonlat <- CRS("+proj=longlat +datum=WGS84")
+
+######### Set up prediction grid. #############
+# Smaller resolution, higher computation time
+res <- 10 # resolution for prediction grid, m
+# Options for size and location of grid:
+# 1. A specified extent - the CEH chambers bbox
+extentCEHchambers <- extent(494247.6, 494291.6, 380905.1, 380945.1)
+# 2. A specified extent - the CEH+York chambers bbox
+extentAllchambers <- extent(494181.3, 494290.2, 380903.6, 381029.4)
+# 3. A specified extent - the whole field bbox
+extentField <- extent(494100, 494350, 380750, 381050)
+
+# Or:
+# 4. Square centred on flux tower, size given by 
+# grid_lth = length of side in metres
+grid_lth   <- 100 # m
+grid_hlth   <- grid_lth / 2
+# 5. Offset from flux tower, given by shiftE & N
+# Leave as zero if centred on tower
+shiftE     <- -25 # m
+shiftN     <- -25 # m
+
+# define EC tower location
+towerLon_degE <- -0.586180071
+towerLat_degN <- 53.31718629
+tower <- SpatialPoints(cbind(towerLon_degE, towerLat_degN))
+proj4string(tower) <- projlonlat
+towerOS <- spTransform(tower, projOSGB)
+summary(towerOS)
+
+extentTower <- extent(towerOS@coords[1,1]-grid_hlth+shiftE, towerOS@coords[1,1]+grid_hlth+shiftE, 
+                      towerOS@coords[1,2]-grid_hlth+shiftN, towerOS@coords[1,2]+grid_hlth+shiftN)
+
+#### Here's where we choose option for grid size & location ####                    
+# uncomment chosen option 1-5 (4/5 = w/o shifting)
+#e <- extentCEHchambers
+#e <- extentAllchambers
+#e <- extentField
+e <- extentTower
+r <- raster(e, resolution = res, crs = projOSGB)
+
+nSamplingSessions <- 12
+
+# don't need this
+r_wider_extent <- raster(nrows=60, ncols=50, xmn=494000, xmx=494500, ymn=380540, ymx=381200, crs=projOSGB)
+r_field_extent <- raster(nrows=60, ncols=50, xmn=494100, xmx=494350, ymn=380750, ymx=381050, crs=projOSGB)
+r_ECextent     <- raster(nrows=60, ncols=50, xmn=494240, xmx=494300, ymn=380900, ymx=380950, crs=projOSGB)
+
+# function to add bounding box to plot
+plot.bbox <- function(enew, lwd =1, col = 'black'){
+  lines(c(enew@xmin, enew@xmin, enew@xmax, enew@xmax,
+  enew@xmin),c(enew@ymin, enew@ymax, enew@ymax, enew@ymin,
+  enew@ymin), lwd=lwd, col =col)
+}
+@
+\section{Static chamber N$_2$O flux data, CEH Edinburgh}
+Static chamber flux measurments were carried out by CEH Edinburgh and Uni. York.  The CEH Edinburgh static chamber fluxes were calculated by the program RCflux (link to this here), and here we read in the output file from this program.  All files are stored in the GREENHOUSE project folder (\verb@P:\NEC04917_GREENHOUSE@), currently run from \Sexpr{wd}.
+
+As far as possible, we define functions to carry out separate tasks in the processing, to keep the program modular and clearer.  Here, we define a function to read and process the CEH Edinburgh chamber fluxes.  The function below reads a csv file, converts flux units to nmol m$^{-2}$\,s$^{-1}$, and merges fluxes with ancilliary data (containing spatial locations, measurement time, soil temperature etc.).  The function returns an object \verb@Fn2oCh@ (Flux of N2O from Chambers), which contains a dataframe \verb@df@ with one row per flux measurement.
+
+<<read_CEH_chamber_data, eval=TRUE>>=
+readFn2oCh <- function(){
+  # read in CEH Edinburgh static chamber flux data from file
+  df <- read.csv("../../RCflux/input/Brattleby/RCfluxOutput.csv")
+
+  # convert umol to nmol m-2 s-1 in all flux columns
+  colnames(df[,5:15])
+  df[,5:15] <- df[,5:15]*1000
+
+  # read in ancilliary data
+  byInputFiles_df                <- read.csv("../../RCflux/input/Brattleby/ancilliaryData_byInputFiles.csv")
+  byChamber_df                   <- read.csv("../../RCflux/input/Brattleby/ancilliaryData_byChamber.csv")
+  bySamplingSession_byChamber_df <- read.csv("../../RCflux/input/Brattleby/ancilliaryData_bySamplingSession_byChamber.csv")
+  names(df)
+
+  df <- merge(df, byInputFiles_df, all.x = TRUE, sort = FALSE) 
+  df <- merge(df,     byChamber_df,    all.x = TRUE, sort = FALSE) 
+  df <- merge(df,     bySamplingSession_byChamber_df, 
+    by.x = c("date", "chamberID"),
+    by.y = c("date", "chamberID"), all.x = TRUE, sort = TRUE) 
+
+  # convert date string to a real date/time
+  df$TIMESTAMP <- paste(df$date, df$startTime_EChh)
+  df$datech <- df$date
+  df <- within(df, date_time <- as.POSIXct(strptime(TIMESTAMP, "%d/%m/%Y %H:%M")))
+  df <- within(df, datect <- as.POSIXct(strptime(date, "%d/%m/%Y"), tz = "UTC"))
+  df <- subset(df, gasName == "N2O") # remove CH4 data
+  return(list(df=df))
+}
+Fn2oCh <- readFn2oCh()
+@
+
+<<plot_histogram>>=
+ggplot(Fn2oCh$df, aes(x = flux_linear)) + geom_histogram(binwidth = 5) + facet_wrap( ~ datect, scales = "fixed")
+@
+
+\verb@flux_linear@ is the flux calculated by linear regression, as opposed to other regression methods, and should probably be replaced.  The histogram shows that there were 13 sampling days between 19/3/2014 and 14/4/2014.  Fluxes are roughly lognornal.
+
+\section{Create SpatialPointsDataFrame}
+<<make_spdf_and_avg, eval=TRUE>>=
+df2spdf <- function(df, projlonlat, projOSGB){
+  # make into a SpatialPointsDataFrame
+  spdf <- df
+  coordinates(spdf) <- ~lon + lat
+  proj4string(spdf) <- projlonlat
+  spdf <- spTransform(spdf, projOSGB)
+  return((spdf=spdf))
+}
+Fn2oCh$spdf <- df2spdf(Fn2oCh$df, projlonlat, projOSGB)
+Fn2oCh$spdf$distFromTower <- spDistsN1(Fn2oCh$spdf, towerOS)
+# remove chambers outwith the prediction grid (don't need to do this, but SkyLine is different)
+Fn2oCh$spdf <- crop(Fn2oCh$spdf, r)
+
+spatAvg <- function(spdf, r){
+  # do spatial averaging
+  rc <- rasterize(spdf, r, field = "flux_linear", fun = mean)
+  plot(rc)
+  # convert to a SpatialPointsDataFrame 
+  Fn2o_mean_spdf <- rasterToPoints(rc, spatial=TRUE)
+  colnames(Fn2o_mean_spdf@data) <- "flux_linear"
+  return((Fn2o_mean_spdf=Fn2o_mean_spdf))
+}
+Fn2oCh$Fn2o_mean_spdf <- spatAvg(Fn2oCh$spdf, r)
+@
+\section{NDVI}
+Some text.
+<<addNDVI, eval=TRUE>>=
+addNDVI <- function(spdf){
+  #spdf <- Fn2oCh$spdf
+  # read NDVI image data
+  r_spot <- raster("../../Data/Lincoln/SPOT_data/spot6_ndvi_3x3_lincs_OSGB.tif", format="GTiff")
+
+  #r <- crop(r_spot, r_ECextent)
+  r_spot <- crop(r_spot, r_wider_extent)
+  plot(r_spot)
+  points(spdf)
+  plot.bbox(extent(r))
+
+  # get the NDVI values for the chamber locations
+  ndvi <- extract(r_spot, spdf)
+  spdf$ndvi <- ndvi
+  summary(spdf)
+  
+  #plot(flux_linear ~ ndvi, data = spdf)
+  #f <- lm(flux_linear ~ ndvi, data = spdf)
+  #abline(f)
+  #summary(f)
+  return((spdf=spdf))
+}
+Fn2oCh$spdf <- addNDVI(Fn2oCh$spdf)
+Fn2oCh$Fn2o_mean_spdf <- addNDVI(Fn2oCh$Fn2o_mean_spdf)
+# get the NDVI values for the prediction grid
+pred_grid <- rasterToPoints(r, spatial=TRUE)
+pred_grid <- addNDVI(pred_grid)
+@
+
+\section{Eddy covariance N$_2$O flux data, CEH Edinburgh}
+Some text.
+<<readFn2oEC, eval=FALSE>>=
+readFn2oEC <- function(){
+  ##<<read in CEH Edinburgh QCL flux data, echo=FALSE, results=hide>=**
+  df <- read.csv("../../Data/Lincoln/EC/eddypro_Linc_essentials_2015-04-29T133448.csv",
+     stringsAsFactors = FALSE, strip.white = TRUE, na.strings = c("NA","","-9999.0000000000000", "-9999") )
+  length(df)
+  for (i in 5:272){
+    df[,i] <- suppressWarnings(as.numeric(df[,i]))
+  }
+  df$TIMESTAMP <- paste(df$date, df$time)
+  df$datech <- df$date
+  df <- within(df, date <- as.POSIXct(strptime(TIMESTAMP, "%Y-%m-%d %H:%M")))
+  df <- within(df, datelt <- as.POSIXlt(strptime(TIMESTAMP, "%Y-%m-%d %H:%M")))
+  df <- within(df, hour <- datelt$hour)
+
+  df$ws <- df$wind_speed; df$wd <- df$wind_dir
+  windRose(df)
+  df$n2o_flux <- df$n2o_flux*1000 # convert umol to nmol m-2 s-1
+  df$ru_n2o <- df$ru_n2o*1000 # convert umol to nmol m-2 s-1
+  hist(df$n2o_flux)
+  return(list(df=df))
+}
+Fn2oEC <- readFn2oEC()
+@
+
+\section{Eddy covariance CO$_2$ flux data, CEH Wallingford}
+Some text.
+<<readFco2EC, eval=FALSE>>=
+readFco2EC <- function(){
+  df <- read.csv("../../Data/Lincoln/EC/eddypro_Brattleby_ConCrop_OilSee_essentials_2014-08-19T194333.csv",
+     stringsAsFactors = FALSE, strip.white = TRUE, na.strings = c("NA","","-9999","-9999.0000000000000","-6999.0000000000000") )
+  for (i in 5:274){
+    df[,i] <- suppressWarnings(as.numeric(df[,i]))
+  }
+  df$TIMESTAMP <- paste(df$date, df$time)
+  df$datech <- df$date
+  df <- within(df, date <- as.POSIXct(strptime(TIMESTAMP, "%Y-%m-%d %H:%M")))
+  df <- within(df, datelt <- as.POSIXlt(strptime(TIMESTAMP, "%Y-%m-%d %H:%M")))
+  df <- within(df, hour <- datelt$hour)
+  summary(df)
+
+  df$ws <- df$wind_speed; df$wd <- df$wind_dir
+  #windRose(df)
+  #hist(df$wind_dir)
+  return(list(df=df))
+}
+Fco2EC <- readFco2EC()
+@
+
+\section{Static chamber flux data, Uni. York}
+Some text.
+<<readFn2oChYork, eval=FALSE>>=
+readFn2oChYork <- function(){
+  #N:\0Peter\prop\UKinverseFlux\GHG_TAP\skyline_vsEC\skyline.csv
+  # read in Uni. York SkyLine flux data
+  #load(file="C:/0Peter/prop/UKinverseFlux/GHG_TAP/skyline_vsEC/Fn2o_SkylineChambers.RData", verbose=TRUE)
+  df <- read.csv("../../Data/Lincoln/skyline_vsEC/skyline.csv")
+  df <- within(df, date   <- as.POSIXct(strptime(DATETIME, "%d/%m/%Y %H:%M")))
+  df <- within(df, datelt <- as.POSIXlt(strptime(DATETIME, "%d/%m/%Y %H:%M")))
+  df <- within(df, hour <- datelt$hour)
+  df$chamberID <- df$CHANNEL
+  df$chamberID <- df$chamberID + 100
+  #df <- subset(df, N2O_nmolM2S > -10 & N2O_nmolM2S < 60)
+  return(list(df=df))
+  #save(df, file="C:/0Peter/prop/UKinverseFlux/GHG_TAP/skyline_vsEC/Fn2o_SkylineChambers.RData")
+}
+Fn2oChYork <- readFn2oChYork()
+plot(N2O_nmolM2S ~ date, data=Fn2oChYork$df)
+@
+
+\section{Merge data frames}
+Some text.
+<<merge data frames>>=
+mergedEC_df <- merge(Fn2oEC$df,     Fco2EC$df, 
+  by.x = c("date"),
+  by.y = c("date"), all.x = TRUE, sort = TRUE) 
+
+mergedChEC_df <- merge(Fn2oCh$df,     Fn2oEC$df, 
+  by.x = c("date_time"),
+  by.y = c("date"), all.x = TRUE, sort = TRUE) 
+
+mergedChEC_df$ws <- mergedChEC_df$wind_speed; mergedChEC_df$wd <- mergedChEC_df$wind_dir
+mergedChEC_df$chamberLoc <- "Field"
+mergedChEC_df$chamberLoc[mergedChEC_df$chamberID > 16] <- "Skyline"
+mergedChEC_df <- subset(mergedChEC_df, samplingSession.x <= nSamplingSessions)
+@
+
+\section{Eddy covariance footprint data, CEH Edinburgh}
+Some text.
+<<readStackFootprint, eval=FALSE>>=
+# takes 30 mins to run
+readStackFootprint <- function(nSamplingSessions){
+  # read in the footprint raster stack
+  load("../../Data/Lincoln/EC/footprintStack_Brattleby_index.RData", verbose=TRUE)
+  s <- stack("../../Data/Lincoln/EC/footprintStack_Brattleby.tif")
+  # initialise stack for sampling session means
+  sfp <- s[[1:nSamplingSessions]]
+  sfp <- setValues(sfp, NA)
+  sfp
+
+  # find the indices in the footprint stack for each chamber measurement
+  ind <- match(Fn2oCh$df$date_time, index_df$datect, nomatch = NA_integer_, incomparables = NULL)
+  Fn2oCh$df$samplingSession.y
+  names(Fn2oCh$df)
+  
+  # get the indices in the footprint stack for all chamber measurements in each sampling session
+  # and average the footprint over these times
+  # could be weighted towards the more common times without getting just the unique list
+  for (iSamplingSession in 1:nSamplingSessions){
+    #iSamplingSession <- 1
+    sessionIndices <- ind[Fn2oCh$df$samplingSession.y == iSamplingSession]
+    sessionIndices <- subset(sessionIndices, !is.na(sessionIndices))
+    sessionIndices <- unique(sessionIndices)
+    sfp[[iSamplingSession]] <- mean(s[[sessionIndices]])  
+  }
+  plot(sfp[[1:nSamplingSessions]])
+  cellStats(sfp[[1]], sum)
+  return(list(sfp=sfp))
+}
+stackFootprint <- readStackFootprint(nSamplingSessions)
+@
+
+\section{Interpolate chamber fluxes with Bayesian Kriging}
+Some text.
+<<interpolateChamberFlux>>=
+interpolateChamberFlux <- function(spdf, r, pred_grid, nSamplingSessions){
+  #spdf <- Fn2oCh$spdf
+  grid_coords <- rasterToPoints(r)
+  s_Fn2o_interp <- stack()
+  # initialise vector for sd
+  Fn2o_ch_interp_sd <- seq(1, nSamplingSessions)
+  
+  par(mfrow = c(4, 2))
+  for (isamplingSession in 1:nSamplingSessions){  # max(spdf$samplingSession.x)
+    #isamplingSession <- 1
+    sdf <- subset(spdf, samplingSession.x == isamplingSession)
+    geo_Fn2o <- as.geodata(sdf, data.col = 7, covar.col=40)
+    maxdist  <- variog(geo_Fn2o)$max.dist
+    seqphi_sparse <- seq(0,2*maxdist,l=)
+    # Now we do the analysis:
+    geo_Fn2o_bayes <- krige.bayes(
+                          geo_Fn2o,
+                          loc=grid_coords,
+                          #model=model.control( trend.d="cte", trend.l="cte", cov.model="matern",
+                          model=model.control( trend.d=trend.spatial(~ndvi, geo_Fn2o), 
+                                               trend.l=trend.spatial(~ndvi, pred_grid), 
+                                               cov.model="matern",
+                                               kappa=0.5, aniso.pars=NULL, lambda=1 ),
+                          prior=prior.control( beta.prior="flat",
+                                               sigmasq.prior="reciprocal",
+                                               phi.prior="uniform", phi.discrete=seqphi_sparse,
+                                               tausq.rel.prior="fixed", tausq.rel=0 ),
+                          output=output.control( n.posterior=100, messages=FALSE )
+                                   )
+    colMeans(geo_Fn2o_bayes$posterior$sample)
+    rp <- setValues(r, geo_Fn2o_bayes$predictive$mean)
+    rp <- flip(rp, direction = "y")
+    #plot(rp, col=terrain.colors(21))
+    #s_Fn2o_interp[[isamplingSession]] <- rp
+    s_Fn2o_interp <- stack(s_Fn2o_interp, rp)
+    Fn2o_ch_interp_sd[isamplingSession] <- sd(geo_Fn2o_bayes$predictive$sim.means)
+    # We create the maps
+    image  (geo_Fn2o_bayes,
+            val=geo_Fn2o_bayes$predictive$mean,
+            xlim=c(rp@extent@xmin,rp@extent@xmax), ylim=c(rp@extent@ymin-10,rp@extent@ymax),
+            col=terrain.colors(21), xlab="lon", ylab="lat")
+    points (geo_Fn2o, cex.max = 1, col = "black", add=T, pt.divide="equal" )
+    contour(geo_Fn2o_bayes, add=T, nlev=11)
+    legend.krige(val=geo_Fn2o_bayes$predictive$mean,
+                 col=terrain.colors(21),
+                 x.leg=c(rp@extent@xmin,rp@extent@xmax), y.leg=c(rp@extent@ymin-10,rp@extent@ymin-5) )
+    # And we plot the standard deviations (square root of kriging variance)
+  #  image  (geo_Fn2o_bayes,
+  #          val=sqrt(geo_Fn2o_bayes$predictive$variance),
+  #          xlim=c(xmin,xmax), ylim=c(ymin-10,ymax),
+  #          col=terrain.colors(21), xlab="lon", ylab="lat")
+  #  points (geo_Fn2o, cex.max = 0.5, col = "black", add=T, pt.divide="equal" )
+  #  legend.krige(val=sqrt(geo_Fn2o_bayes$predictive$variance),
+  #               col=terrain.colors(21),
+  #               x.leg=c(xmin,xmax), y.leg=c(ymin-10,ymin-5) )
+  }
+
+  par(mfrow = c(4, 4))
+  for (i in (1:16)) {
+    image  (geo_Fn2o_bayes,
+            val=geo_Fn2o_bayes$predictive$simulations[,i],
+            xlim=c(rp@extent@xmin,rp@extent@xmax), ylim=c(rp@extent@ymin-10,rp@extent@ymax),
+            col=terrain.colors(21), xlab="lon", ylab="lat")
+    points (geo_Fn2o, cex.max = 0.5, col = "black", add=T, pt.divide="equal" )
+    legend.krige(val=sqrt(geo_Fn2o_bayes$predictive$variance),
+                 col=terrain.colors(21),
+                 x.leg=c(rp@extent@xmin,rp@extent@xmax), y.leg=c(rp@extent@ymin-10,rp@extent@ymin-5) )
+  }
+
+  str(geo_Fn2o_bayes$predictive$mean)
+  sd(geo_Fn2o_bayes$predictive$sim.means)
+  names(s_Fn2o_interp)[] <- "F_n2o_pred"
+  return(list(s_Fn2o_interp=s_Fn2o_interp, Fn2o_ch_interp_sd=Fn2o_ch_interp_sd))
+}
+i <- interpolateChamberFlux(Fn2oCh$spdf, r, pred_grid, nSamplingSessions)
+s_Fn2o_interp <- i$s_Fn2o_interp
+Fn2o_ch_interp_sd <- i$Fn2o_ch_interp_sd
+plot(s_Fn2o_interp)
+@
+
+\section{Plot on Google map}
+<<ggmap1>>=
+map0 <- get_map(location = c(lon = -0.5868, lat = 53.31705706), zoom = 17, maptype = "hybrid")
+#map0 <- get_map(location = tower@bbox, zoom = 17, maptype = "hybrid")
+map <- ggmap(map0, extent = "device")
+
+map <- map + geom_point(aes(x = lon, y = lat, size = flux_linear), colour = "red", data = Fn2oCh$df)
+map <- map + facet_wrap( ~  samplingSession.x)
+map 
+
+# plot grid on top
+map <- ggmap(map0, extent = "device")
+iSamplingSession <- 5
+# convert to lat lon for Google Map
+r_ll <- projectRaster(s_Fn2o_interp[[iSamplingSession]], crs = projlonlat)
+# convert to a SpatialPointsDataFrame 
+Fn2o_interp <- rasterToPoints(r_ll)
+Fn2o_interp <- data.frame(Fn2o_interp)
+
+# to plot raster data on top of a ggmap image
+# interpolated flux raster
+colnames(Fn2o_interp)[3] <- "F_n2o_pred"
+map <- map + geom_tile(data=Fn2o_interp, aes(x=x,y=y, fill = F_n2o_pred), alpha = 0.5) + scale_fill_gradient(low="green", high="red")
+# flux chambers
+map <- map + geom_point(data = subset(Fn2oCh$df, samplingSession.x == iSamplingSession), aes(x = lon, y = lat, colour = flux_linear)) + scale_colour_gradient(low="green", high="red")
+print(map)
+@
+
+<<ggmap2>>=
+#map0 <- get_map(location = c(lon = -0.5868, lat = 53.31705706), zoom = 17, maptype = "hybrid")
+map <- ggmap(map0, extent = "device")
+
+# read NDVI image data
+r_spot <- raster("../../Data/Lincoln/SPOT_data/spot6_ndvi_3x3_lincs_OSGB.tif", format="GTiff")
+r_spot <- crop(r_spot, extentField)
+# convert to lat lon for Google Map
+r_ll <- projectRaster(r_spot, crs = projlonlat)
+# convert to a SpatialPointsDataFrame 
+ndvi <- rasterToPoints(r_ll)
+ndvi <- data.frame(ndvi)
+
+# to plot raster data on top of a ggmap image
+# interpolated flux raster
+colnames(ndvi)[3] <- "ndvi"
+map <- map + geom_tile(data=ndvi, aes(x=x,y=y, fill = ndvi), alpha = 0.5) + scale_fill_gradient(low="green", high="red")
+# flux chambers
+map <- map + geom_point(aes(x = lon, y = lat, size = flux_linear), colour = "blue", data = subset(Fn2oCh$df, samplingSession.x == iSamplingSession & chamberID <= 16))
+print(map)
+@
+
+\section{Weight predicted chamber fluxes with footprint}
+Some text.
+<<weightChamberFlux>>=
+# force sfp stack to same dimensions as interpolated Fn2o grid
+# if readStackFootprint is run once for all sessions, we can avoid re-running by subsetting here
+sfp_agg <- stackFootprint$sfp[[1:nSamplingSessions]]
+# force sfp grid to same extent as interpolated Fn2o grid
+sfp_agg <- extend(sfp_agg, s_Fn2o_interp) # whether smaller ...
+sfp_agg <-   crop(sfp_agg, s_Fn2o_interp) # or larger
+# Need to normalise by sum of footprint weight in prediction grid
+# Will be <1 if prediction grid smaller than footprint grid
+# Where wind dir is opposite direction, zero weight gives NA.
+sfp_agg <- sfp_agg / as.numeric(cellStats(sfp_agg, sum))
+# and aggregate to same resolution
+scaleFactor <- res(s_Fn2o_interp)[1] / res(stackFootprint$sfp)[1]
+sfp_agg <- aggregate(sfp_agg, fact = scaleFactor, fun=sum)
+
+# do the weighting; only sum of s_Fn2o_interp_weighted is interesting, not pattern
+s_Fn2o_interp_weighted <- s_Fn2o_interp * sfp_agg
+
+Fn2o_ch_interp_mean <-  as.numeric(cellStats(s_Fn2o_interp, mean))
+Fn2o_ch_interp_wmean <- as.numeric(cellStats(s_Fn2o_interp_weighted, sum))
+#plot(Fn2o_ch_interp_mean, Fn2o_ch_interp_wmean)
+plot(s_Fn2o_interp_weighted)
+@
+
+\section{Calculate uncertainty intervals on mean flux for each samplingSession}
+Some text.
+<<calcCI>>=
+# naive CIs in chamber flux means for each samplingSession
+# based on variability in the 16 values
+Fn2oCh$cidf <- group.CI(flux_linear ~ samplingSession.x, Fn2oCh$df)
+Fn2oCh$cidf <- subset(Fn2oCh$cidf, samplingSession.x <= nSamplingSessions)
+
+# get means for EC data for each samplingSession
+dfm  <- ddply(mergedChEC_df, .(samplingSession.x), numcolwise(mean, na.rm = TRUE))
+dim(dfm)
+# add 7 cols for naive CIs, spatially interpolated mean & SD, 
+# and footprint-weighted spatially interpolated mean
+# should also add footprint-weighted spatially interpolated SD
+dfm <- data.frame(dfm, Fn2oCh$cidf, Fn2o_ch_interp_mean, Fn2o_ch_interp_wmean, Fn2o_ch_interp_sd)
+dim(dfm)
+#summary(dfm)
+@
+
+\section{Plot uncertainty intervals}
+Some text.
+<<plotCI>>=
+p <- ggplot(dfm, aes(n2o_flux, Fn2o_ch_interp_wmean)) #+ theme_bw()
+p <- p + geom_point() #+ xlim(-0.1, 10) + ylim(-0.1, 20)
+p <- p + geom_errorbarh(aes(xmax = n2o_flux + ru_n2o, xmin = n2o_flux - ru_n2o))
+p <- p + geom_errorbar(aes(ymax = Fn2o_ch_interp_wmean + Fn2o_ch_interp_sd*2, ymin = Fn2o_ch_interp_wmean - Fn2o_ch_interp_sd*2, colour = "incl. spatial interpolation"))
+p <- p + geom_abline()
+p <- p + geom_point(data = dfm, aes(n2o_flux+0.1, flux_linear, colour = "arithmetic mean"), colour = "blue")
+p <- p + geom_errorbar(aes(x = n2o_flux+0.1, ymax =  flux_linear.upper, ymin =  flux_linear.lower, colour = "excl. spatial interpolation"))
+p <- p + geom_errorbarh(aes(xmax = n2o_flux+0.1 + ru_n2o, xmin = n2o_flux+0.1 - ru_n2o, y = flux_linear))
+p <- p + xlab(expression(paste(N[2]*"O flux by EC / "*~nmol~m^-2~s^-1)))
+p <- p + ylab(expression(paste(N[2]*"O flux by chambers / "*~nmol~m^-2~s^-1)))
+p <- p + ggtitle("Footprint-weighted spatial interpolation with prediction errors")
+p + guides(colour=guide_legend(title="Uncertainty"))
+
+# repeat removing biggest outlier
+p <- ggplot(dfm, aes(n2o_flux, Fn2o_ch_interp_wmean)) #+ theme_bw()
+p <- p + geom_point() + xlim(-0.1, 5) + ylim(-5, 20)
+p <- p + geom_errorbarh(aes(xmax = n2o_flux + ru_n2o, xmin = n2o_flux - ru_n2o))
+p <- p + geom_errorbar(aes(ymax = Fn2o_ch_interp_wmean + Fn2o_ch_interp_sd*2, ymin = Fn2o_ch_interp_wmean - Fn2o_ch_interp_sd*2, colour = "incl. spatial interpolation"))
+p <- p + geom_abline()
+p <- p + geom_point(data = dfm, aes(n2o_flux+0.1, flux_linear, colour = "arithmetic mean"), colour = "blue")
+p <- p + geom_errorbar(aes(x = n2o_flux+0.1, ymax =  flux_linear.upper, ymin =  flux_linear.lower, colour = "excl. spatial interpolation"))
+p <- p + geom_errorbarh(aes(xmax = n2o_flux+0.1 + ru_n2o, xmin = n2o_flux+0.1 - ru_n2o, y = flux_linear))
+p <- p + xlab(expression(paste(N[2]*"O flux by EC / "*~nmol~m^-2~s^-1)))
+p <- p + ylab(expression(paste(N[2]*"O flux by chambers / "*~nmol~m^-2~s^-1)))
+p <- p + ggtitle("Footprint-weighted spatial interpolation with prediction errors")
+p + guides(colour=guide_legend(title="Uncertainty"))
+@
+
+<<label=fig_Fn2o_vsDate_ECandChambers,include=TRUE,echo=FALSE>>=
+fert_date <- c("2014-03-24 12:00", "2014-04-01 10:30")
+fert_datect <- as.numeric(as.POSIXct(strptime(fert_date, "%Y-%m-%d %H:%M")))
+fert_kgNha <- c(200, 200)
+fert_df <- data.frame(fert_date, fert_datect, fert_kgNha)
+
+# discretise the flux time series
+Fn2oEC$df <- subset(Fn2oEC$df, !is.na(n2o_flux))
+Fn2oEC$df <- subset(Fn2oEC$df, n2o_flux > 0)
+Fn2oEC$df$datect <- Fn2oEC$df$date
+j <- round(Fn2oEC$df$n2o_flux*1)
+flux_freq <- NULL
+for (i in 1:dim(Fn2oEC$df)[1]){
+#i <- 973
+  flux_freq <- c(flux_freq, rep(Fn2oEC$df$datect[i], j[i]))
+}
+
+nsecs <- max(flux_freq) - min(flux_freq)
+nbreaks <- nsecs/(30*60)
+hist(flux_freq, breaks=nbreaks)
+require(MASS)
+wfit <- fitdistr(flux_freq, "lognormal")
+# print results
+wfit
+# save scale and shape from the output
+wscale <- wfit$estimate[1]
+wshape <- wfit$estimate[2]
+
+# compare histogram & pdf
+h <- hist(flux_freq, breaks=nbreaks)
+xhist <- c(min(h$breaks),h$breaks)
+yhist <- c(0, h$density, 0)
+xfit <- seq(min(flux_freq), max(flux_freq), length=nbreaks)
+yfit <- dlnorm(xfit, meanlog=wscale, sdlog=wshape)
+plot(xhist, yhist, type="s", ylim=c(0, max(yhist, yfit)))
+lines(xfit, yfit, col="red")
+
+# cumulative plot
+x <- xfit
+plot(x, pweibull(x, scale=wscale, shape=wshape), type="l", col="red", main="ECDF and Weibull CDF")
+plot(x, plnorm(x, meanlog=wscale, sdlog=wshape), type="l", col="red", main="ECDF and Weibull CDF")
+with(Fn2oEC$df, plot(ecdf(n2o_flux), add=TRUE))
+
+# qqplot
+x.wei <- rweibull(n=200, scale=wscale, shape=wshape) ## sampling from a Weibull
+with(wind_df, qqplot(mean_wind_speed, x.wei, main="QQ-plot distr. Weibull")) ## QQ-plot
+abline(0,1) ## a 45-degree reference line is plotted
+
+
+p <- ggplot() + theme_bw()
+p <- p + geom_ribbon(data = Fn2oEC$df, aes(x=date, ymin=n2o_flux-ru_n2o, ymax=n2o_flux+ru_n2o), fill = "grey")
+p <- p + geom_line(data = Fn2oEC$df, aes(date, n2o_flux))
+p <- p + geom_pointrange(data=subset(Fn2oCh$df, chamberID < 17), aes(date_time, flux_linear, ymin = ci95lo_linear, ymax= ci95hi_linear, colour = as.factor(chamberID))) + guides(colour=FALSE)
+p <- p + ylab(expression(paste(N[2]*"O flux / "*~nmol~m^-2~s^-1)))
+p <- p + geom_vline(data=fert_df, aes(xintercept = fert_datect), colour="green")
+#p <- p + facet_wrap( ~ chamberID, scales = "fixed")
+p
+
+
+\end{document}

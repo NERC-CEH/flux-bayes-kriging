@@ -6,17 +6,15 @@ output:
   html_document:
     number_sections: yes
     toc: no
+    keep_md: yes
 ---
 
-```{r, rendering, eval=FALSE}
+```{r, rendering, eval=FALSE, echo = FALSE}
 library(rmarkdown)
 library(here)
-knitr::purl("vignettes/LincolnFluxDataAnalysis.Rmd",
-  output = "vignettes/LincolnFluxDataAnalysis.R")
-system.time(rmarkdown::render("vignettes/LincolnFluxDataAnalysis.Rmd"))
-tools::texi2pdf("LincolnFluxDataAnalysis.tex")
-source("LincolnFluxDataAnalysis.R")
-knitr::knit("LincolnFluxDataAnalysis.Rnw")
+system.time(rmarkdown::render("vignettes/flux-bayes-kriging.Rmd"))
+knitr::purl("vignettes/flux-bayes-kriging.Rmd",
+  output = "vignettes/flux-bayes-kriging.R")
 ```
 
 ## Background
@@ -31,7 +29,7 @@ A more thorough description of the background and terminology is given [here](ht
 The code is written in the R language. The following R packages are used for graphics and spatial analysis.
 
 ```{r, clean up and load required packages}
-here::i_am("vignettes/LincolnFluxDataAnalysis.Rmd")
+here::i_am("vignettes/flux-bayes-kriging.Rmd")
 # install.packages(c("here", "ggplot2", "raster", "geoR", "viridis")) # if not already installed
 library(here)
 library(ggplot2)

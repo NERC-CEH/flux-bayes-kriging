@@ -110,7 +110,7 @@ head(df)
 ggplot(df, aes(x = flux)) + geom_histogram(bins = 30)
 ```
 
-![](README_files/figure-html/plot_histogram-1.png)<!-- -->
+![](flux-bayes-kriging_files/figure-html/plot_histogram-1.png)<!-- -->
 
 We can rasterise the data and plot them on the prediction grid.
 
@@ -122,7 +122,7 @@ points(df[, 1:2])
 title(main = "Flux from 16 chamber locations rasterised on 3-m grid (nmol/m2/s)")
 ```
 
-![](README_files/figure-html/plot_spatially-1.png)<!-- -->
+![](flux-bayes-kriging_files/figure-html/plot_spatially-1.png)<!-- -->
 
 For working in `geoR`, the data need to be converted to a "geodata" object, specifying which columns contain the coordinates and the  flux data values. Additional covariates could be included in the data, but are not used here. The data are then summarised and plotted.
 
@@ -153,7 +153,7 @@ summary(gdf)
 plot(gdf)
 ```
 
-![](README_files/figure-html/summarise_data-1.png)<!-- -->
+![](flux-bayes-kriging_files/figure-html/summarise_data-1.png)<!-- -->
 
 We can plot a basic empirical variogram from the data.
 
@@ -169,14 +169,14 @@ vgm <- variog(gdf)
 plot(vgm)
 ```
 
-![](README_files/figure-html/variogram-1.png)<!-- -->
+![](flux-bayes-kriging_files/figure-html/variogram-1.png)<!-- -->
 
 As expected, variance increases with distance, but the variogram is not smooth, and the range is not clear. There is no clear asymptote, but there are fewer pairs of points with large distances, so these points receive less weight, and the variogram is less reliable at large distances.
 
 ## Prior distributions for the variogram model parameters
 For a Bayesian analysis, we need to specify the prior distributions for the parameters of the variogram model.  Here we use a uniform prior for the range ($\phi$) and mean ($\beta$), and a reciprocal prior for the sill ($\sigma^2$).  This means that all values of $\phi$ and $\beta$ within the specified range are equally probable, whereas large values of $\sigma^2$ become increasingly improbable, in proportion to their reciprocal. The prior distributions are plotted below. The intercept of "nugget" ($\tau$) is assumed to be zero, but can be estimated as well. Alternative values and assumptions can be specified by changing the  code within `krige.bayes`.
 
-![](README_files/figure-html/plot_priors-1.png)<!-- -->
+![](flux-bayes-kriging_files/figure-html/plot_priors-1.png)<!-- -->
 
 
 ## Bayesian Kriging
@@ -197,7 +197,7 @@ system.time(bsp <- interpolate_flux(df, r, n_posterior = 10000))
 
 ```
 ##    user  system elapsed 
-##    1.03    0.11    1.96
+##    0.62    0.03    1.97
 ```
 
 We can now examine the estmated variogram model with its approximate bounds.
@@ -234,7 +234,7 @@ legend(0.15, 50, legend = c("posterior mean",
   "posterior median"), lty = c(1, 2), lwd = c(1, 1), cex = 0.8)
 ```
 
-![](README_files/figure-html/variogram2-1.png)<!-- -->
+![](flux-bayes-kriging_files/figure-html/variogram2-1.png)<!-- -->
 
 The joint posterior distributions of the variogram model parameters are shown below. The mean values of the parameters are also displayed.
 
@@ -246,7 +246,7 @@ plot(density(bsp$posterior$sample$sigmasq), main = "", xlab = expression(sigma^2
 plot(density(bsp$posterior$sample$beta), main = "", xlab = expression(beta))
 ```
 
-![](README_files/figure-html/posteriorDistributions-1.png)<!-- -->
+![](flux-bayes-kriging_files/figure-html/posteriorDistributions-1.png)<!-- -->
 
 ```r
 colMeans(bsp$posterior$sample)
@@ -266,7 +266,7 @@ The mean of the predicted fluxes are plotted below. The mean is the average of t
 plot_mean_prediction(bsp, r, df)
 ```
 
-![](README_files/figure-html/interpolateChamberFlux1-1.png)<!-- -->
+![](flux-bayes-kriging_files/figure-html/interpolateChamberFlux1-1.png)<!-- -->
 
 The standard deviation of the posterior samples (below) is the appropriate measure of uncertainty in the predictions. This is lowest in areas where there are more data points and highest where there are fewer data points or where the data are more variable.
 
@@ -275,7 +275,7 @@ The standard deviation of the posterior samples (below) is the appropriate measu
 plot_sigma_prediction(bsp, r, df)
 ```
 
-![](README_files/figure-html/interpolateChamberFlux2-1.png)<!-- -->
+![](flux-bayes-kriging_files/figure-html/interpolateChamberFlux2-1.png)<!-- -->
 
 As well as these summary variables, we can plot individual realisations of the flux field, to give an idea of the range of possible spatial patterns consistent with the data. Here we show six examples, but typically thousands are generated in the posterior sampling.
 
@@ -284,5 +284,5 @@ As well as these summary variables, we can plot individual realisations of the f
 plot_realisations(bsp, r, df, n_realisations = 6)
 ```
 
-![](README_files/figure-html/interpolateChamberFlux3-1.png)<!-- -->
+![](flux-bayes-kriging_files/figure-html/interpolateChamberFlux3-1.png)<!-- -->
 
